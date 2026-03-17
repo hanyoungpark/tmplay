@@ -11,10 +11,11 @@ if(EXISTS "${CMAKE_CURRENT_BINARY_DIR}/conan_toolchain.cmake")
 endif()
 
 find_package(ffmpeg REQUIRED)
+find_package(ftxui REQUIRED)
 
 add_executable(tmplay src/main.cpp)
 target_include_directories(tmplay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
-target_link_libraries(tmplay PRIVATE ffmpeg::ffmpeg)
+target_link_libraries(tmplay PRIVATE ffmpeg::ffmpeg ftxui::ftxui)
 
 # macOS: link frameworks if needed
 if(APPLE)
