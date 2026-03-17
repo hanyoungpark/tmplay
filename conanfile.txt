@@ -1,5 +1,6 @@
 [requires]
 ffmpeg/8.0.1
+ftxui/6.1.9
 
 [generators]
 CMakeDeps

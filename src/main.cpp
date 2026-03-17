@@ -1,5 +1,6 @@
 // Terminal video player for macOS — C++20, FFmpeg, CMake + Conan
 // Full pixel playback: Kitty / WezTerm / Warp / iTerm2 image protocol support
+// FTXUI: floating centered window (320px width, aspect-ratio height)
 
 #include <array>
 #include <chrono>
@@ -29,6 +30,9 @@ extern "C" {
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #endif
+
+#include <ftxui/dom/elements.hpp>
+#include <ftxui/screen/screen.hpp>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"  // third_party (PNG for iTerm2)
@@ -297,14 +301,16 @@ struct Decoder {
 
 void render_to_terminal(const std::vector<uint8_t>& rgb,
                         int in_width, int in_height,
-                        int term_cols, int term_rows) {
+                        int term_cols, int term_rows,
+                        bool cursor_at_home = true) {
   // Each terminal cell = block of pixels. 2 chars width per block for aspect.
   const int block_w = (in_width + term_cols - 1) / term_cols;
   const int block_h = (in_height + term_rows - 1) / term_rows;
   if (block_w <= 0 || block_h <= 0)
     return;
 
-  std::cout << "\033[H";  // cursor home
+  if (cursor_at_home)
+    std::cout << "\033[H";  // cursor home (skip when drawing in floating window)
 
   for (int ty = 0; ty < term_rows; ++ty) {
     int y = ty * block_h;
@@ -346,7 +352,25 @@ void render_to_terminal(const std::vector<uint8_t>& rgb,
     if (ty + 1 < term_rows)
       std::cout << "\n";
   }
-  std::cout << "\033[0m" << std::flush;
+    std::cout << "\033[0m" << std::flush;
+}
+
+// ——— FTXUI: floating window (centered box) ———
+
+constexpr int FLOAT_WINDOW_PIXEL_WIDTH = 320;
+
+void render_floating_window_frame(int box_inner_cols, int box_inner_rows,
+                                   int content_rows) {
+  using namespace ftxui;
+  auto inner = emptyElement()
+               | size(WIDTH, EQUAL, box_inner_cols)
+               | size(HEIGHT, EQUAL, box_inner_rows);
+  auto box = borderDouble(inner);
+  auto doc = center(box);
+  // Use content_rows height so box stays above status line (last row)
+  auto screen = Screen::Create(Dimension::Full(), Dimension::Fixed(content_rows));
+  Render(screen, doc);
+  screen.Print();
 }
 
 }  // namespace
@@ -371,42 +395,33 @@ int main(int argc, char* argv[]) {
   TermSize term = get_term_size();
   DisplayMode mode = detect_display_mode();
 
-  int out_width;
-  int out_height;
-  int render_rows;
-  if (mode == DisplayMode::Block) {
-    render_rows = term.rows > 1 ? term.rows - 1 : term.rows;
-    out_width = term.cols;
-    out_height = render_rows;
-  } else {
-    // Full pixel playback: use terminal pixel size (or estimate from cell count)
-    if (term.xpixel > 0 && term.ypixel > 0) {
-      out_width = term.xpixel;
-      out_height = term.ypixel > 40 ? term.ypixel - 40 : term.ypixel;  // bottom margin
-    } else {
-      out_width = term.cols * 8;
-      out_height = (term.rows > 1 ? term.rows - 1 : term.rows) * 16;
-    }
-    out_width = (out_width / 2) * 2;
-    out_height = (out_height / 2) * 2;
-    if (mode == DisplayMode::Iterm2Image) {
-      // iTerm2 OSC sequence ~1MB limit
-      if (out_width > 1200) out_width = 1200;
-      if (out_height > 676) out_height = 676;
-    } else {
-      if (out_width > 1920) out_width = 1920;
-      if (out_height > 1080) out_height = 1080;
-    }
-    render_rows = term.rows;
-  }
+  // Floating window: fixed width 320px, height by video aspect ratio
+  const int out_width = FLOAT_WINDOW_PIXEL_WIDTH;
+  int out_height = (FLOAT_WINDOW_PIXEL_WIDTH * dec.height) / dec.width;
+  out_height = (out_height / 2) * 2;  // even for scaler
+  if (mode == DisplayMode::Iterm2Image && out_height > 676)
+    out_height = 676;
+
+  // Box size in terminal cells (~8px col, ~16px row per cell)
+  const int box_inner_cols = 40;
+  const int box_inner_rows = std::max(1, (out_height + 15) / 16);
+  // Reserve last row for status line; center box in the rest
+  const int content_rows = term.rows > 1 ? term.rows - 1 : term.rows;
+  const int video_cursor_row = (content_rows - (box_inner_rows + 2)) / 2 + 2;
+  const int video_cursor_col = (term.cols - (box_inner_cols + 2)) / 2 + 2;
+
+  const int status_row = term.rows;
 
   set_raw_terminal(true);
   clear_screen();
   hide_cursor();
 
+  // Draw floating window border once (avoids flicker in Warp/Kitty)
+  render_floating_window_frame(box_inner_cols, box_inner_rows, content_rows);
+
   if (mode != DisplayMode::Block)
-    std::cerr << "Image mode: " << (mode == DisplayMode::KittyImage ? "Kitty/WezTerm/Warp" : "iTerm2")
-              << " — " << out_width << "x" << out_height << " px\n";
+    std::cerr << "Floating " << out_width << "x" << out_height << " px — "
+              << (mode == DisplayMode::KittyImage ? "Kitty/WezTerm/Warp" : "iTerm2") << "\n";
 
   std::vector<uint8_t> rgb;
   auto frame_start = std::chrono::steady_clock::now();
@@ -437,18 +452,18 @@ int main(int argc, char* argv[]) {
 
     video_time = dec.next_pts_seconds();
 
+    // Only update image area + status line (border drawn once above)
+    std::cout << "\033[" << video_cursor_row << ";" << video_cursor_col << "H";
     if (mode == DisplayMode::KittyImage) {
-      std::cout << "\033[H";
       render_kitty_image(rgb, out_width, out_height);
     } else if (mode == DisplayMode::Iterm2Image) {
-      std::cout << "\033[H";
       render_iterm2_image(rgb, out_width, out_height);
     } else {
-      render_to_terminal(rgb, out_width, out_height, term.cols, render_rows);
+      render_to_terminal(rgb, out_width, out_height, box_inner_cols, box_inner_rows, false);
     }
 
-    // Status line
-    std::cout << "\033[" << render_rows << ";1H\033[K";
+    // Status line (reserved last row)
+    std::cout << "\033[" << status_row << ";1H\033[K";
     int min = static_cast<int>(video_time / 60);
     int sec = static_cast<int>(std::fmod(video_time, 60.0));
     std::cout << " time: " << min << ":" << std::setfill('0') << std::setw(2) << sec
