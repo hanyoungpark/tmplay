@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -402,26 +403,28 @@ int main(int argc, char* argv[]) {
   if (mode == DisplayMode::Iterm2Image && out_height > 676)
     out_height = 676;
 
-  // Box size in terminal cells (~8px col, ~16px row per cell)
-  const int box_inner_cols = 40;
-  const int box_inner_rows = std::max(1, (out_height + 15) / 16);
-  // Reserve last row for status line; center box in the rest
-  const int content_rows = term.rows > 1 ? term.rows - 1 : term.rows;
-  const int video_cursor_row = (content_rows - (box_inner_rows + 2)) / 2 + 2;
-  const int video_cursor_col = (term.cols - (box_inner_cols + 2)) / 2 + 2;
-
-  const int status_row = term.rows;
+  // Box size in terminal cells: use actual cell pixel size when available so border fits image
+  auto box_cells_from_term = [out_width, out_height](const TermSize& t) -> std::pair<int, int> {
+    if (t.xpixel > 0 && t.ypixel > 0 && t.cols > 0 && t.rows > 0) {
+      int cw = t.xpixel / t.cols;
+      int ch = t.ypixel / t.rows;
+      if (cw > 0 && ch > 0) {
+        int cols = (out_width + cw - 1) / cw;
+        int rows = (out_height + ch - 1) / ch;
+        return {std::max(1, cols), std::max(1, rows)};
+      }
+    }
+    return {40, std::max(1, (out_height + 15) / 16)};  // fallback 8x16
+  };
+  int box_inner_cols = box_cells_from_term(term).first;
+  int box_inner_rows = box_cells_from_term(term).second;
 
   set_raw_terminal(true);
-  clear_screen();
-  hide_cursor();
-
-  // Draw floating window border once (avoids flicker in Warp/Kitty)
-  render_floating_window_frame(box_inner_cols, box_inner_rows, content_rows);
-
   if (mode != DisplayMode::Block)
     std::cerr << "Floating " << out_width << "x" << out_height << " px — "
               << (mode == DisplayMode::KittyImage ? "Kitty/WezTerm/Warp" : "iTerm2") << "\n";
+  clear_screen();
+  hide_cursor();
 
   std::vector<uint8_t> rgb;
   auto frame_start = std::chrono::steady_clock::now();
@@ -429,7 +432,55 @@ int main(int argc, char* argv[]) {
   bool paused = false;
   bool quit = false;
 
+  auto refresh_layout = [&]() {
+    TermSize t = get_term_size();
+    int content_rows = t.rows > 1 ? t.rows - 1 : t.rows;
+    int video_cursor_row = (content_rows - (box_inner_rows + 2)) / 2 + 2;
+    int video_cursor_col = (t.cols - (box_inner_cols + 2)) / 2 + 2;
+    int status_row = t.rows;
+    clear_screen();
+    render_floating_window_frame(box_inner_cols, box_inner_rows, content_rows);
+    return std::make_tuple(content_rows, video_cursor_row, video_cursor_col, status_row);
+  };
+
+  auto draw_frame_and_status = [&](int video_cursor_row, int video_cursor_col,
+                                  int status_row) {
+    std::cout << "\033[" << video_cursor_row << ";" << video_cursor_col << "H";
+    if (mode == DisplayMode::KittyImage) {
+      render_kitty_image(rgb, out_width, out_height);
+    } else if (mode == DisplayMode::Iterm2Image) {
+      render_iterm2_image(rgb, out_width, out_height);
+    } else {
+      render_to_terminal(rgb, out_width, out_height, box_inner_cols, box_inner_rows, false);
+    }
+    std::cout << "\033[" << status_row << ";1H\033[K";
+    int min = static_cast<int>(video_time / 60);
+    int sec = static_cast<int>(std::fmod(video_time, 60.0));
+    std::cout << " time: " << min << ":" << std::setfill('0') << std::setw(2) << sec
+              << " [space] pause [q] quit " << std::flush;
+  };
+
+  int content_rows = term.rows > 1 ? term.rows - 1 : term.rows;
+  int video_cursor_row = (content_rows - (box_inner_rows + 2)) / 2 + 2;
+  int video_cursor_col = (term.cols - (box_inner_cols + 2)) / 2 + 2;
+  int status_row = term.rows;
+
+  render_floating_window_frame(box_inner_cols, box_inner_rows, content_rows);
+
   while (!quit) {
+    TermSize current_term = get_term_size();
+    if (current_term.rows != term.rows || current_term.cols != term.cols) {
+      term = current_term;
+      auto [bc, br] = box_cells_from_term(term);
+      box_inner_cols = bc;
+      box_inner_rows = br;
+      std::tie(content_rows, video_cursor_row, video_cursor_col, status_row) = refresh_layout();
+      if (!rgb.empty())
+        draw_frame_and_status(video_cursor_row, video_cursor_col, status_row);
+      frame_start = std::chrono::steady_clock::now();
+      continue;
+    }
+
     // Non-blocking key read
     char key = 0;
     if (read(STDIN_FILENO, &key, 1) > 0) {
@@ -452,22 +503,7 @@ int main(int argc, char* argv[]) {
 
     video_time = dec.next_pts_seconds();
 
-    // Only update image area + status line (border drawn once above)
-    std::cout << "\033[" << video_cursor_row << ";" << video_cursor_col << "H";
-    if (mode == DisplayMode::KittyImage) {
-      render_kitty_image(rgb, out_width, out_height);
-    } else if (mode == DisplayMode::Iterm2Image) {
-      render_iterm2_image(rgb, out_width, out_height);
-    } else {
-      render_to_terminal(rgb, out_width, out_height, box_inner_cols, box_inner_rows, false);
-    }
-
-    // Status line (reserved last row)
-    std::cout << "\033[" << status_row << ";1H\033[K";
-    int min = static_cast<int>(video_time / 60);
-    int sec = static_cast<int>(std::fmod(video_time, 60.0));
-    std::cout << " time: " << min << ":" << std::setfill('0') << std::setw(2) << sec
-              << " [space] pause [q] quit " << std::flush;
+    draw_frame_and_status(video_cursor_row, video_cursor_col, status_row);
 
     // Simple frame pacing (target ~25 fps if no timestamp)
     auto now = std::chrono::steady_clock::now();
