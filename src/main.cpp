@@ -10,17 +10,22 @@
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
+#include <atomic>
 #include <iostream>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <tuple>
+#include <vector>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
+#include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 }
 
@@ -29,6 +34,7 @@ extern "C" {
 #include <unistd.h>
 
 #ifdef __APPLE__
+#include <AudioToolbox/AudioToolbox.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #endif
@@ -305,6 +311,387 @@ struct Decoder {
   }
 };
 
+#ifdef __APPLE__
+// ——— macOS audio (separate demuxer + AudioQueue; stereo S16 @ 44.1kHz) ———
+
+class MacAudioPlayer {
+ public:
+  MacAudioPlayer() = default;
+  ~MacAudioPlayer() { shutdown(); }
+  MacAudioPlayer(const MacAudioPlayer&) = delete;
+  MacAudioPlayer& operator=(const MacAudioPlayer&) = delete;
+
+  bool open(const std::string& path);
+  void start();
+  void shutdown();
+  void pause();
+  void resume();
+
+  bool is_open() const { return fmt_ctx_ != nullptr; }
+  /// Seconds of PCM played since AudioQueueStart (device timeline).
+  double playback_sec() const;
+  /// First decoded audio frame PTS in seconds (media timeline); 0 if unknown.
+  double first_pts_media_sec() const {
+    return first_audio_pts_media_sec_.load(std::memory_order_relaxed);
+  }
+  bool has_first_audio_pts() const {
+    return first_pts_set_.load(std::memory_order_relaxed);
+  }
+
+ private:
+  static void aq_callback(void* userdata, AudioQueueRef q, AudioQueueBufferRef buffer);
+  void fill_aq_buffer(AudioQueueRef q, AudioQueueBufferRef buffer);
+  void decode_thread_main();
+  bool decode_one();
+  void push_swr_from_frame();
+  void flush_decoder();
+  void flush_swr();
+
+  AVFormatContext* fmt_ctx_{nullptr};
+  AVCodecContext* codec_ctx_{nullptr};
+  const AVCodec* codec_{nullptr};
+  int stream_index_{-1};
+  AVPacket* pkt_{nullptr};
+  AVFrame* frame_{nullptr};
+  SwrContext* swr_{nullptr};
+
+  AudioQueueRef queue_{nullptr};
+  std::vector<AudioQueueBufferRef> aq_buffers_;
+
+  std::vector<uint8_t> pcm_;
+  size_t read_off_{0};
+  std::mutex pcm_mu_;
+
+  std::thread decode_thread_;
+  std::atomic<bool> stop_decode_{false};
+  std::atomic<bool> decode_eof_{false};
+  std::atomic<bool> first_pts_set_{false};
+  std::atomic<double> first_audio_pts_media_sec_{0.0};
+
+  static constexpr int kOutHz = 44100;
+  static constexpr UInt32 kAqBufferBytes = 16384;
+};
+
+bool MacAudioPlayer::open(const std::string& path) {
+  if (avformat_open_input(&fmt_ctx_, path.c_str(), nullptr, nullptr) < 0)
+    return false;
+  if (avformat_find_stream_info(fmt_ctx_, nullptr) < 0) {
+    avformat_close_input(&fmt_ctx_);
+    fmt_ctx_ = nullptr;
+    return false;
+  }
+  stream_index_ = av_find_best_stream(fmt_ctx_, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+  if (stream_index_ < 0) {
+    avformat_close_input(&fmt_ctx_);
+    fmt_ctx_ = nullptr;
+    return false;
+  }
+  AVStream* st = fmt_ctx_->streams[stream_index_];
+  codec_ = avcodec_find_decoder(st->codecpar->codec_id);
+  if (!codec_) {
+    avformat_close_input(&fmt_ctx_);
+    fmt_ctx_ = nullptr;
+    return false;
+  }
+  codec_ctx_ = avcodec_alloc_context3(codec_);
+  if (!codec_ctx_ || avcodec_parameters_to_context(codec_ctx_, st->codecpar) < 0) {
+    avcodec_free_context(&codec_ctx_);
+    codec_ctx_ = nullptr;
+    avformat_close_input(&fmt_ctx_);
+    fmt_ctx_ = nullptr;
+    return false;
+  }
+  if (avcodec_open2(codec_ctx_, codec_, nullptr) < 0) {
+    avcodec_free_context(&codec_ctx_);
+    codec_ctx_ = nullptr;
+    avformat_close_input(&fmt_ctx_);
+    fmt_ctx_ = nullptr;
+    return false;
+  }
+
+  AVChannelLayout out_ch{};
+  av_channel_layout_default(&out_ch, 2);
+  int swr_err = swr_alloc_set_opts2(&swr_, &out_ch, AV_SAMPLE_FMT_S16, kOutHz,
+                                    &codec_ctx_->ch_layout, codec_ctx_->sample_fmt,
+                                    codec_ctx_->sample_rate, 0, nullptr);
+  if (swr_err < 0 || !swr_ || swr_init(swr_) < 0) {
+    swr_free(&swr_);
+    avcodec_free_context(&codec_ctx_);
+    codec_ctx_ = nullptr;
+    avformat_close_input(&fmt_ctx_);
+    fmt_ctx_ = nullptr;
+    return false;
+  }
+
+  pkt_ = av_packet_alloc();
+  frame_ = av_frame_alloc();
+  if (!pkt_ || !frame_) {
+    shutdown();
+    return false;
+  }
+  return true;
+}
+
+double MacAudioPlayer::playback_sec() const {
+  if (!queue_)
+    return 0.0;
+  AudioTimeStamp ts{};
+  OSStatus err = AudioQueueGetCurrentTime(queue_, nullptr, &ts, nullptr);
+  if (err != noErr)
+    return 0.0;
+  if ((ts.mFlags & kAudioTimeStampSampleTimeValid) == 0)
+    return 0.0;
+  return static_cast<double>(ts.mSampleTime) / static_cast<double>(kOutHz);
+}
+
+void MacAudioPlayer::push_swr_from_frame() {
+  const int64_t delay = swr_get_delay(swr_, frame_->sample_rate);
+  const int64_t max_out =
+      av_rescale_rnd(delay + frame_->nb_samples, kOutHz, frame_->sample_rate, AV_ROUND_UP);
+  if (max_out <= 0)
+    return;
+  uint8_t* out = nullptr;
+  int out_linesize = 0;
+  if (av_samples_alloc(&out, &out_linesize, 2, static_cast<int>(max_out), AV_SAMPLE_FMT_S16, 0) < 0)
+    return;
+  const uint8_t** in = const_cast<const uint8_t**>(frame_->extended_data);
+  int got = swr_convert(swr_, &out, static_cast<int>(max_out), in, frame_->nb_samples);
+  if (got > 0) {
+    int bytes = av_samples_get_buffer_size(nullptr, 2, got, AV_SAMPLE_FMT_S16, 1);
+    if (bytes > 0) {
+      std::lock_guard<std::mutex> lk(pcm_mu_);
+      pcm_.insert(pcm_.end(), out, out + bytes);
+    }
+  }
+  av_freep(&out);
+}
+
+void MacAudioPlayer::flush_decoder() {
+  avcodec_send_packet(codec_ctx_, nullptr);
+  for (;;) {
+    int ret = avcodec_receive_frame(codec_ctx_, frame_);
+    if (ret == AVERROR_EOF || ret < 0)
+      break;
+    push_swr_from_frame();
+  }
+}
+
+void MacAudioPlayer::flush_swr() {
+  if (!swr_)
+    return;
+  constexpr int kChunk = 8192;
+  for (;;) {
+    uint8_t* out = nullptr;
+    int out_linesize = 0;
+    if (av_samples_alloc(&out, &out_linesize, 2, kChunk, AV_SAMPLE_FMT_S16, 0) < 0)
+      break;
+    int got = swr_convert(swr_, &out, kChunk, nullptr, 0);
+    if (got <= 0) {
+      av_freep(&out);
+      break;
+    }
+    int bytes = av_samples_get_buffer_size(nullptr, 2, got, AV_SAMPLE_FMT_S16, 1);
+    if (bytes > 0) {
+      std::lock_guard<std::mutex> lk(pcm_mu_);
+      pcm_.insert(pcm_.end(), out, out + bytes);
+    }
+    av_freep(&out);
+  }
+}
+
+bool MacAudioPlayer::decode_one() {
+  for (;;) {
+    int ret = av_read_frame(fmt_ctx_, pkt_);
+    if (ret == AVERROR_EOF) {
+      flush_decoder();
+      flush_swr();
+      return false;
+    }
+    if (ret < 0) {
+      av_packet_unref(pkt_);
+      continue;
+    }
+    if (pkt_->stream_index != stream_index_) {
+      av_packet_unref(pkt_);
+      continue;
+    }
+    ret = avcodec_send_packet(codec_ctx_, pkt_);
+    av_packet_unref(pkt_);
+    if (ret < 0)
+      continue;
+    ret = avcodec_receive_frame(codec_ctx_, frame_);
+    if (ret == AVERROR(EAGAIN))
+      continue;
+    if (ret < 0)
+      return false;
+    if (!first_pts_set_.load(std::memory_order_relaxed)) {
+      AVStream* st = fmt_ctx_->streams[stream_index_];
+      double tb = av_q2d(st->time_base);
+      int64_t fts = frame_->best_effort_timestamp;
+      if (fts == AV_NOPTS_VALUE)
+        fts = frame_->pts;
+      if (fts != AV_NOPTS_VALUE) {
+        first_audio_pts_media_sec_.store(static_cast<double>(fts) * tb,
+                                         std::memory_order_relaxed);
+        first_pts_set_.store(true, std::memory_order_relaxed);
+      }
+    }
+    push_swr_from_frame();
+    return true;
+  }
+}
+
+void MacAudioPlayer::decode_thread_main() {
+  while (!stop_decode_) {
+    bool too_much = false;
+    {
+      std::lock_guard<std::mutex> lk(pcm_mu_);
+      too_much = (pcm_.size() - read_off_ > 512000);
+    }
+    if (too_much) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(8));
+      continue;
+    }
+    if (!decode_one()) {
+      decode_eof_ = true;
+      break;
+    }
+  }
+}
+
+void MacAudioPlayer::fill_aq_buffer(AudioQueueRef q, AudioQueueBufferRef buffer) {
+  UInt32 cap = buffer->mAudioDataBytesCapacity;
+  auto* dst = static_cast<UInt8*>(buffer->mAudioData);
+  UInt32 done = 0;
+  {
+    std::lock_guard<std::mutex> lk(pcm_mu_);
+    while (done < cap && read_off_ < pcm_.size()) {
+      size_t chunk = std::min(static_cast<size_t>(cap - done), pcm_.size() - read_off_);
+      std::memcpy(dst + done, pcm_.data() + read_off_, chunk);
+      read_off_ += chunk;
+      done += static_cast<UInt32>(chunk);
+    }
+    if (read_off_ > 262144 && read_off_ > pcm_.size() / 2) {
+      pcm_.erase(pcm_.begin(), pcm_.begin() + static_cast<std::ptrdiff_t>(read_off_));
+      read_off_ = 0;
+    }
+  }
+  if (done < cap)
+    std::memset(dst + done, 0, cap - done);
+  buffer->mAudioDataByteSize = cap;
+  AudioQueueEnqueueBuffer(q, buffer, 0, nullptr);
+}
+
+void MacAudioPlayer::aq_callback(void* userdata, AudioQueueRef q, AudioQueueBufferRef buffer) {
+  auto* self = static_cast<MacAudioPlayer*>(userdata);
+  self->fill_aq_buffer(q, buffer);
+}
+
+void MacAudioPlayer::start() {
+  if (!fmt_ctx_ || queue_)
+    return;
+
+  AudioStreamBasicDescription desc{};
+  desc.mSampleRate = kOutHz;
+  desc.mFormatID = kAudioFormatLinearPCM;
+  desc.mFormatFlags =
+      kLinearPCMFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+  desc.mBitsPerChannel = 16;
+  desc.mChannelsPerFrame = 2;
+  desc.mBytesPerFrame = 4;
+  desc.mFramesPerPacket = 1;
+  desc.mBytesPerPacket = 4;
+
+  OSStatus st = AudioQueueNewOutput(&desc, aq_callback, this, nullptr, nullptr, 0, &queue_);
+  if (st != noErr || !queue_)
+    return;
+
+  AudioQueueSetParameter(queue_, kAudioQueueParam_Volume, 1.0f);
+
+  stop_decode_ = false;
+  decode_eof_ = false;
+  decode_thread_ = std::thread(&MacAudioPlayer::decode_thread_main, this);
+
+  // Wait briefly for PCM so priming buffers can carry real samples (not 0-byte enqueue).
+  for (int w = 0; w < 100; ++w) {
+    {
+      std::lock_guard<std::mutex> lk(pcm_mu_);
+      if (pcm_.size() - read_off_ >= static_cast<size_t>(kAqBufferBytes))
+        break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+
+  for (int i = 0; i < 3; ++i) {
+    AudioQueueBufferRef buf = nullptr;
+    if (AudioQueueAllocateBuffer(queue_, kAqBufferBytes, &buf) != noErr || !buf)
+      continue;
+    aq_buffers_.push_back(buf);
+    fill_aq_buffer(queue_, buf);
+  }
+
+  AudioQueueStart(queue_, nullptr);
+}
+
+void MacAudioPlayer::pause() {
+  if (queue_)
+    AudioQueuePause(queue_);
+}
+
+void MacAudioPlayer::resume() {
+  if (queue_)
+    AudioQueueStart(queue_, nullptr);
+}
+
+void MacAudioPlayer::shutdown() {
+  stop_decode_ = true;
+  if (decode_thread_.joinable())
+    decode_thread_.join();
+
+  if (queue_) {
+    AudioQueueStop(queue_, true);
+    for (AudioQueueBufferRef b : aq_buffers_)
+      AudioQueueFreeBuffer(queue_, b);
+    aq_buffers_.clear();
+    AudioQueueDispose(queue_, true);
+    queue_ = nullptr;
+  }
+
+  swr_free(&swr_);
+  av_frame_free(&frame_);
+  av_packet_free(&pkt_);
+  avcodec_free_context(&codec_ctx_);
+  avformat_close_input(&fmt_ctx_);
+
+  {
+    std::lock_guard<std::mutex> lk(pcm_mu_);
+    pcm_.clear();
+    read_off_ = 0;
+  }
+  stream_index_ = -1;
+  codec_ = nullptr;
+  decode_eof_ = false;
+  first_pts_set_.store(false);
+  first_audio_pts_media_sec_.store(0.0);
+}
+
+#else
+
+class MacAudioPlayer {
+ public:
+  bool open(const std::string&) { return false; }
+  void start() {}
+  void shutdown() {}
+  void pause() {}
+  void resume() {}
+  bool is_open() const { return false; }
+  double playback_sec() const { return 0.0; }
+  double first_pts_media_sec() const { return 0.0; }
+  bool has_first_audio_pts() const { return false; }
+};
+
+#endif  // __APPLE__
+
 // ——— Render frame to terminal (block chars + grayscale or 24-bit true color) ———
 
 void render_to_terminal(const std::vector<uint8_t>& rgb,
@@ -394,7 +781,8 @@ void render_floating_window_frame(int box_inner_cols, int box_inner_rows,
 
 static void print_usage(const char* prog) {
   std::cerr << "Usage: " << (prog ? prog : "tmplay")
-            << " [-c|--colormode grayscale|truecolor] <video_file>\n"
+            << " [--mute] [-c|--colormode grayscale|truecolor] <video_file>\n"
+            << "  Default: play audio (macOS); use --mute to disable.\n"
             << "  Default colormode: truecolor (block mode only).\n";
 }
 
@@ -414,12 +802,17 @@ static bool arg_iequals(const char* a, const char* b) {
 
 int main(int argc, char* argv[]) {
   BlockColorMode block_color_mode = BlockColorMode::Truecolor;
+  bool mute = false;
   std::string path;
 
   for (int i = 1; i < argc; ++i) {
     const char* a = argv[i];
     if (!a)
       continue;
+    if (std::strcmp(a, "--mute") == 0) {
+      mute = true;
+      continue;
+    }
     if (std::strcmp(a, "-c") == 0 || std::strcmp(a, "--colormode") == 0) {
       if (i + 1 >= argc) {
         std::cerr << "Error: " << a << " requires grayscale or truecolor\n";
@@ -468,6 +861,11 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
+  MacAudioPlayer audio;
+  const bool audio_on = (!mute && audio.open(path));
+  if (audio_on)
+    audio.start();
+
   TermSize term = get_term_size();
   DisplayMode mode = detect_display_mode();
 
@@ -506,7 +904,6 @@ int main(int argc, char* argv[]) {
   hide_cursor();
 
   std::vector<uint8_t> rgb;
-  auto frame_start = std::chrono::steady_clock::now();
   double video_time = 0.0;
   bool paused = false;
   bool quit = false;
@@ -547,6 +944,7 @@ int main(int argc, char* argv[]) {
 
   render_floating_window_frame(box_inner_cols, box_inner_rows, content_rows);
 
+  bool prev_paused = false;
   while (!quit) {
     TermSize current_term = get_term_size();
     if (current_term.rows != term.rows || current_term.cols != term.cols) {
@@ -557,7 +955,6 @@ int main(int argc, char* argv[]) {
       std::tie(content_rows, video_cursor_row, video_cursor_col, status_row) = refresh_layout();
       if (!rgb.empty())
         draw_frame_and_status(video_cursor_row, video_cursor_col, status_row);
-      frame_start = std::chrono::steady_clock::now();
       continue;
     }
 
@@ -572,6 +969,13 @@ int main(int argc, char* argv[]) {
 
     if (quit)
       break;
+    if (audio_on && paused != prev_paused) {
+      if (paused)
+        audio.pause();
+      else
+        audio.resume();
+      prev_paused = paused;
+    }
     if (paused) {
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
       continue;
@@ -581,18 +985,38 @@ int main(int argc, char* argv[]) {
       break;
     }
 
-    video_time = dec.next_pts_seconds();
+    const double vpts = dec.next_pts_seconds();
+
+    // Pace video to audio (audio master); without audio, use consecutive PTS deltas.
+    constexpr double kSyncLeadSec = 0.045;
+    if (audio_on) {
+      double a0 = audio.first_pts_media_sec();
+      if (!audio.has_first_audio_pts())
+        a0 = 0.0;
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(10);
+      while (std::chrono::steady_clock::now() < deadline && !quit) {
+        const double played = audio.playback_sec();
+        if (a0 + played >= vpts - kSyncLeadSec)
+          break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+    } else {
+      static std::optional<double> prev_vpts_pacing;
+      if (prev_vpts_pacing && vpts > *prev_vpts_pacing) {
+        const double delta = vpts - *prev_vpts_pacing;
+        if (delta > 0.0 && delta < 2.0)
+          std::this_thread::sleep_for(std::chrono::duration<double>(delta));
+      }
+      prev_vpts_pacing = vpts;
+    }
+
+    video_time = vpts;
 
     draw_frame_and_status(video_cursor_row, video_cursor_col, status_row);
-
-    // Simple frame pacing (target ~25 fps if no timestamp)
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration<double>(now - frame_start).count();
-    double target = 1.0 / 25.0;
-    if (elapsed < target)
-      std::this_thread::sleep_for(std::chrono::duration<double>(target - elapsed));
-    frame_start = std::chrono::steady_clock::now();
   }
+
+  audio.shutdown();
 
   show_cursor();
   set_raw_terminal(false);

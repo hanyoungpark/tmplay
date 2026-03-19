@@ -41,11 +41,12 @@ Executable: `build/tmplay`
 ### Command format
 
 ```bash
-./build/tmplay [-c|--colormode grayscale|truecolor] <video_file>
+./build/tmplay [--mute] [-c|--colormode grayscale|truecolor] <video_file>
 ```
 
 ### Options
 
+- **`--mute`**: do not play audio (default is **with sound** on macOS when an audio stream exists).
 - **`-c`, `--colormode <mode>`**
   - `grayscale`: 256-color grayscale in block mode
   - `truecolor`: 24-bit ANSI color in block mode (**default**)
@@ -62,7 +63,17 @@ Executable: `build/tmplay`
 
 # explicit truecolor
 ./build/tmplay --colormode truecolor sample.mp4
+
+# video only (no audio)
+./build/tmplay --mute sample.mp4
+
+# mute + block grayscale (order of flags is flexible)
+./build/tmplay --mute -c grayscale sample.mp4
 ```
+
+### Audio (macOS)
+
+If the file has an audio track, **tmplay** opens a second demuxer, decodes audio with FFmpeg, resamples to **stereo 16-bit PCM at 44.1 kHz**, and plays via **AudioQueue**. **Video timing follows audio** (`AudioQueueGetCurrentTime` vs frame PTS). With **`--mute`**, video is paced using consecutive frame PTS deltas instead. Pause (**Space**) pauses both.
 
 ### Runtime keys
 
@@ -73,9 +84,10 @@ Executable: `build/tmplay`
 
 - `--colormode` affects **block mode only**.
 - In image-capable terminals (Kitty/WezTerm/Warp/iTerm2), image protocol rendering is used instead.
+- Audio is **macOS-only** in this build; other platforms ignore `--mute` / have no audio output.
 
 ## Project layout
 
-- `conanfile.txt` — Conan dependencies (ffmpeg)
-- `CMakeLists.txt` — CMake build (C++20, Conan integration)
-- `src/main.cpp` — Video decoding (FFmpeg) + terminal rendering (ANSI / image protocols)
+- `conanfile.txt` — Conan dependencies (ffmpeg, ftxui)
+- `CMakeLists.txt` — CMake build (C++20, Conan integration, AudioToolbox on macOS)
+- `src/main.cpp` — Video/audio decoding (FFmpeg) + terminal rendering (ANSI / image protocols / FTXUI)
