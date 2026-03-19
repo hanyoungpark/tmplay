@@ -9,7 +9,7 @@ Uses C++20, CMake, Conan (dependencies), and FFmpeg (decoding).
 
 - **Kitty / WezTerm / Warp**: Kitty graphics protocol (RGB), up to 1920×1080
 - **iTerm2**: PNG inline images (OSC limit, up to ~1200×676)
-- Other terminals: block characters + 256 colors
+- Other terminals: block characters + 24-bit true color (ANSI `38;2;r;g;b`)
 
 The terminal is auto-detected via `TERM`, `TERM_PROGRAM` (e.g. WarpTerminal, iTerm), `KITTY_WINDOW_ID`, etc.  
 In image mode, terminal pixel size (`ws_xpixel`/`ws_ypixel`) is used when available; otherwise resolution is estimated from cell count.
@@ -38,14 +38,41 @@ Executable: `build/tmplay`
 
 ## Usage
 
+### Command format
+
 ```bash
-./build/tmplay <video_file>
+./build/tmplay [-c|--colormode grayscale|truecolor] <video_file>
 ```
+
+### Options
+
+- **`-c`, `--colormode <mode>`**
+  - `grayscale`: 256-color grayscale in block mode
+  - `truecolor`: 24-bit ANSI color in block mode (**default**)
+  - aliases: `greyscale`, `gray`, `rgb`, `24bit`
+
+### Examples
+
+```bash
+# default (block mode = truecolor)
+./build/tmplay sample.mp4
+
+# block mode grayscale
+./build/tmplay -c grayscale sample.mp4
+
+# explicit truecolor
+./build/tmplay --colormode truecolor sample.mp4
+```
+
+### Runtime keys
 
 - **Space**: pause / resume  
 - **q**: quit  
 
-Video is rendered with block characters and 256 colors on unsupported terminals, or as full pixel images where supported.
+### Notes
+
+- `--colormode` affects **block mode only**.
+- In image-capable terminals (Kitty/WezTerm/Warp/iTerm2), image protocol rendering is used instead.
 
 ## Project layout
 
