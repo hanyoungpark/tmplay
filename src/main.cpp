@@ -134,8 +134,9 @@ std::string base64_encode(const uint8_t* data, size_t len) {
   return out;
 }
 
-// Kitty graphics protocol: 24-bit RGB, chunks ≤4096, multiple of 4 except last
-void render_kitty_image(const std::vector<uint8_t>& rgb, int w, int h) {
+// Kitty graphics protocol: 24-bit RGB, chunks <=4096, multiple of 4 except last
+void render_kitty_image(const std::vector<uint8_t>& rgb, int w, int h,
+                        int cell_cols = 0, int cell_rows = 0) {
   constexpr int MAX_CHUNK = 4096;
   std::string b64 = base64_encode(rgb.data(), rgb.size());
   size_t pos = 0;
@@ -146,7 +147,10 @@ void render_kitty_image(const std::vector<uint8_t>& rgb, int w, int h) {
       chunk_len -= chunk_len % 4;
     bool more = (pos + chunk_len) < b64.size();
     if (first) {
-      std::cout << "\033_Ga=T,f=24,s=" << w << ",v=" << h << ",m=" << (more ? 1 : 0) << ";";
+      std::cout << "\033_Ga=T,f=24,s=" << w << ",v=" << h;
+      if (cell_cols > 0 && cell_rows > 0)
+        std::cout << ",c=" << cell_cols << ",r=" << cell_rows;
+      std::cout << ",m=" << (more ? 1 : 0) << ";";
       first = false;
     } else {
       std::cout << "\033_Gm=" << (more ? 1 : 0) << ";";
@@ -303,7 +307,8 @@ struct Decoder {
 void render_to_terminal(const std::vector<uint8_t>& rgb,
                         int in_width, int in_height,
                         int term_cols, int term_rows,
-                        bool cursor_at_home = true) {
+                        bool cursor_at_home = true,
+                        int start_col = 1) {
   // Each terminal cell = block of pixels. 2 chars width per block for aspect.
   const int block_w = (in_width + term_cols - 1) / term_cols;
   const int block_h = (in_height + term_rows - 1) / term_rows;
@@ -350,10 +355,13 @@ void render_to_terminal(const std::vector<uint8_t>& rgb,
         ansi = 255;
       std::cout << "\033[38;5;" << ansi << "m" << BLOCKS[block_idx];
     }
-    if (ty + 1 < term_rows)
-      std::cout << "\n";
+    if (ty + 1 < term_rows) {
+      std::cout << "\033[E";
+      if (start_col > 1)
+        std::cout << "\033[" << start_col << "G";
+    }
   }
-    std::cout << "\033[0m" << std::flush;
+  std::cout << "\033[0m" << std::flush;
 }
 
 // ——— FTXUI: floating window (centered box) ———
@@ -447,11 +455,12 @@ int main(int argc, char* argv[]) {
                                   int status_row) {
     std::cout << "\033[" << video_cursor_row << ";" << video_cursor_col << "H";
     if (mode == DisplayMode::KittyImage) {
-      render_kitty_image(rgb, out_width, out_height);
+      render_kitty_image(rgb, out_width, out_height, box_inner_cols, box_inner_rows);
     } else if (mode == DisplayMode::Iterm2Image) {
       render_iterm2_image(rgb, out_width, out_height);
     } else {
-      render_to_terminal(rgb, out_width, out_height, box_inner_cols, box_inner_rows, false);
+      render_to_terminal(rgb, out_width, out_height, box_inner_cols, box_inner_rows, false,
+                         video_cursor_col);
     }
     std::cout << "\033[" << status_row << ";1H\033[K";
     int min = static_cast<int>(video_time / 60);
