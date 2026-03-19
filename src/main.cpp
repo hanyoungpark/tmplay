@@ -5,6 +5,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -43,6 +44,8 @@ namespace {
 // ——— Display mode: block art vs full pixel image ———
 
 enum class DisplayMode { Block, KittyImage, Iterm2Image };
+
+enum class BlockColorMode { Grayscale, Truecolor };
 
 DisplayMode detect_display_mode() {
   const char* term = std::getenv("TERM");
@@ -302,11 +305,12 @@ struct Decoder {
   }
 };
 
-// ——— Render frame to terminal (block chars + 256 color) ———
+// ——— Render frame to terminal (block chars + grayscale or 24-bit true color) ———
 
 void render_to_terminal(const std::vector<uint8_t>& rgb,
                         int in_width, int in_height,
                         int term_cols, int term_rows,
+                        BlockColorMode color_mode,
                         bool cursor_at_home = true,
                         int start_col = 1) {
   // Each terminal cell = block of pixels. 2 chars width per block for aspect.
@@ -344,16 +348,19 @@ void render_to_terminal(const std::vector<uint8_t>& rgb,
         g /= n;
         b /= n;
       }
-      // Luminance 0..255 -> block index 0..4
+      // Luminance -> block density; color from mode
       int lum = (r * 77 + g * 150 + b * 29) >> 8;
       size_t block_idx = static_cast<size_t>(lum * (BLOCKS.size() + 1)) >> 8;
       if (block_idx >= BLOCKS.size())
         block_idx = BLOCKS.size() - 1;
-      // 256-color ANSI: 232-255 are grayscale
-      int ansi = 232 + (lum * 24) / 256;
-      if (ansi > 255)
-        ansi = 255;
-      std::cout << "\033[38;5;" << ansi << "m" << BLOCKS[block_idx];
+      if (color_mode == BlockColorMode::Grayscale) {
+        int ansi = 232 + (lum * 24) / 256;
+        if (ansi > 255)
+          ansi = 255;
+        std::cout << "\033[38;5;" << ansi << "m" << BLOCKS[block_idx];
+      } else {
+        std::cout << "\033[38;2;" << r << ";" << g << ";" << b << "m" << BLOCKS[block_idx];
+      }
     }
     if (ty + 1 < term_rows) {
       std::cout << "\033[E";
@@ -366,7 +373,8 @@ void render_to_terminal(const std::vector<uint8_t>& rgb,
 
 // ——— FTXUI: floating window (centered box) ———
 
-constexpr int FLOAT_WINDOW_PIXEL_WIDTH = 320;
+constexpr int FLOAT_WINDOW_PIXEL_MODE_WIDTH = 320;  // Kitty / iTerm2 (image protocol)
+constexpr int FLOAT_WINDOW_BLOCK_MODE_WIDTH = 640;  // block mode: 2× decode for finer blocks
 
 void render_floating_window_frame(int box_inner_cols, int box_inner_rows,
                                    int content_rows) {
@@ -384,12 +392,71 @@ void render_floating_window_frame(int box_inner_cols, int box_inner_rows,
 
 }  // namespace
 
+static void print_usage(const char* prog) {
+  std::cerr << "Usage: " << (prog ? prog : "tmplay")
+            << " [-c|--colormode grayscale|truecolor] <video_file>\n"
+            << "  Default colormode: truecolor (block mode only).\n";
+}
+
+static bool arg_iequals(const char* a, const char* b) {
+  if (!a || !b)
+    return false;
+  while (*a && *b) {
+    char ca = static_cast<char>(std::tolower(static_cast<unsigned char>(*a)));
+    char cb = static_cast<char>(std::tolower(static_cast<unsigned char>(*b)));
+    if (ca != cb)
+      return false;
+    ++a;
+    ++b;
+  }
+  return *a == *b;
+}
+
 int main(int argc, char* argv[]) {
-  if (argc < 2) {
-    std::cerr << "Usage: " << (argv[0] ? argv[0] : "tmplay") << " <video_file>\n";
+  BlockColorMode block_color_mode = BlockColorMode::Truecolor;
+  std::string path;
+
+  for (int i = 1; i < argc; ++i) {
+    const char* a = argv[i];
+    if (!a)
+      continue;
+    if (std::strcmp(a, "-c") == 0 || std::strcmp(a, "--colormode") == 0) {
+      if (i + 1 >= argc) {
+        std::cerr << "Error: " << a << " requires grayscale or truecolor\n";
+        print_usage(argv[0]);
+        return 1;
+      }
+      const char* v = argv[++i];
+      if (arg_iequals(v, "grayscale") || arg_iequals(v, "greyscale") ||
+          arg_iequals(v, "gray")) {
+        block_color_mode = BlockColorMode::Grayscale;
+      } else if (arg_iequals(v, "truecolor") || arg_iequals(v, "rgb") ||
+                 arg_iequals(v, "24bit")) {
+        block_color_mode = BlockColorMode::Truecolor;
+      } else {
+        std::cerr << "Error: unknown colormode '" << v
+                  << "' (use grayscale or truecolor)\n";
+        print_usage(argv[0]);
+        return 1;
+      }
+    } else if (a[0] == '-') {
+      std::cerr << "Error: unknown option " << a << '\n';
+      print_usage(argv[0]);
+      return 1;
+    } else {
+      if (!path.empty()) {
+        std::cerr << "Error: multiple video paths\n";
+        print_usage(argv[0]);
+        return 1;
+      }
+      path = a;
+    }
+  }
+
+  if (path.empty()) {
+    print_usage(argv[0]);
     return 1;
   }
-  std::string path = argv[1];
 
   av_log_set_level(AV_LOG_QUIET);
 
@@ -404,9 +471,12 @@ int main(int argc, char* argv[]) {
   TermSize term = get_term_size();
   DisplayMode mode = detect_display_mode();
 
-  // Floating window: fixed width 320px, height by video aspect ratio
-  const int out_width = FLOAT_WINDOW_PIXEL_WIDTH;
-  int out_height = (FLOAT_WINDOW_PIXEL_WIDTH * dec.height) / dec.width;
+  // Floating window: block mode decodes at 2× width for sharper characters; pixel mode stays 320
+  const bool pixel_image_mode =
+      (mode == DisplayMode::KittyImage || mode == DisplayMode::Iterm2Image);
+  const int out_width =
+      pixel_image_mode ? FLOAT_WINDOW_PIXEL_MODE_WIDTH : FLOAT_WINDOW_BLOCK_MODE_WIDTH;
+  int out_height = (out_width * dec.height) / dec.width;
   out_height = (out_height / 2) * 2;  // even for scaler
   if (mode == DisplayMode::Iterm2Image && out_height > 676)
     out_height = 676;
@@ -422,7 +492,8 @@ int main(int argc, char* argv[]) {
         return {std::max(1, cols), std::max(1, rows)};
       }
     }
-    return {40, std::max(1, (out_height + 15) / 16)};  // fallback 8x16
+    return {std::max(1, (out_width + 7) / 8),
+            std::max(1, (out_height + 15) / 16)};  // fallback ~8×16 px/cell
   };
   int box_inner_cols = box_cells_from_term(term).first;
   int box_inner_rows = box_cells_from_term(term).second;
@@ -459,8 +530,8 @@ int main(int argc, char* argv[]) {
     } else if (mode == DisplayMode::Iterm2Image) {
       render_iterm2_image(rgb, out_width, out_height);
     } else {
-      render_to_terminal(rgb, out_width, out_height, box_inner_cols, box_inner_rows, false,
-                         video_cursor_col);
+      render_to_terminal(rgb, out_width, out_height, box_inner_cols, box_inner_rows,
+                         block_color_mode, false, video_cursor_col);
     }
     std::cout << "\033[" << status_row << ";1H\033[K";
     int min = static_cast<int>(video_time / 60);
