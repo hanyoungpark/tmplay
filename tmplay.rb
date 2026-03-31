@@ -1,8 +1,8 @@
 class Tmplay < Formula
   desc "Terminal video player with Kitty/iTerm2/block rendering and audio support"
   homepage "https://github.com/hanyoungpark/tmplay"
-  url "https://github.com/hanyoungpark/tmplay/archive/refs/tags/v1.0.0.tar.gz"
-  sha256 "PLACEHOLDER_SHA256"  # run: brew fetch --build-from-source Formula/tmplay.rb
+  url "https://github.com/hanyoungpark/tmplay/archive/refs/tags/v0.1.0.tar.gz"
+  sha256 "1e2cbdc032e75e034332ef71f3f1c96ed9be34c05a22a39a95f2898460e12d8d"
   license "MIT"
 
   depends_on "cmake" => :build

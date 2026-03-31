@@ -14,6 +14,14 @@ Uses C++20, CMake, Conan (dependencies), and FFmpeg (decoding).
 The terminal is auto-detected via `TERM`, `TERM_PROGRAM` (e.g. WarpTerminal, iTerm), `KITTY_WINDOW_ID`, etc.  
 In image mode, terminal pixel size (`ws_xpixel`/`ws_ypixel`) is used when available; otherwise resolution is estimated from cell count.
 
+## Installation
+
+### Homebrew (macOS)
+
+```bash
+brew install hanyoungpark/tmplay/tmplay
+```
+
 ## Requirements
 
 - macOS
